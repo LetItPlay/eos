@@ -189,6 +189,9 @@ public:
 
    get_table_rows_result get_table_rows( const get_table_rows_params& params )const;
 
+   template<typename SecondaryIndex>
+   get_table_rows_result get_table_rows_by_secondary(const read_only::get_table_rows_params& p, int index_order, const abi_def& abi) const;
+
    struct get_currency_balance_params {
       name             code;
       name             account;
@@ -249,37 +252,41 @@ public:
       }
    }
 
-   template <typename IndexType, typename Scope>
-   read_only::get_table_rows_result get_table_rows_ex( const read_only::get_table_rows_params& p, const abi_def& abi )const {
-      read_only::get_table_rows_result result;
-      const auto& d = db.db();
-
-      uint64_t scope = 0;
-      try {
-         name s(p.scope);
-         scope = s.value;
+   uint64_t parse_scope(const string &scope) const {
+	   try {
+         name s(scope);
+         return s.value;
       } catch( ... ) {
          try {
-            auto trimmed_scope_str = p.scope;
+            auto trimmed_scope_str = scope;
             boost::trim(trimmed_scope_str);
-            scope = boost::lexical_cast<uint64_t>(trimmed_scope_str.c_str(), trimmed_scope_str.size());
+            return boost::lexical_cast<uint64_t>(trimmed_scope_str.c_str(), trimmed_scope_str.size());
          } catch( ... ) {
             try {
-               auto symb = eosio::chain::symbol::from_string(p.scope);
-               scope = symb.value();
+               auto symb = eosio::chain::symbol::from_string(scope);
+               return symb.value();
             } catch( ... ) {
                try {
-                  scope = ( eosio::chain::string_to_symbol( 0, p.scope.c_str() ) >> 8 );
+                  return ( eosio::chain::string_to_symbol( 0, scope.c_str() ) >> 8 );
                } catch( ... ) {
                   FC_ASSERT( false, "could not convert scope string to any of the following: uint64_t, valid name, or valid symbol (with or without the precision)" );
                }
             }
          }
       }
+   }
+
+   template <typename IndexType, typename Scope>
+   read_only::get_table_rows_result get_table_rows_ex( const read_only::get_table_rows_params& p, const abi_def& abi, const uint64_t index_table)const {
+      read_only::get_table_rows_result result;
+      const auto& d = db.db();
+
+      uint64_t scope = parse_scope(p.scope);
 
       abi_serializer abis;
       abis.set_abi(abi);
-      const auto* t_id = d.find<chain::table_id_object, chain::by_code_scope_table>(boost::make_tuple(p.code, scope, p.table));
+
+      const auto* t_id = d.find<chain::table_id_object, chain::by_code_scope_table>(boost::make_tuple(p.code, scope, index_table));
       if (t_id != nullptr) {
          const auto &idx = d.get_index<IndexType, Scope>();
          decltype(t_id->id) next_tid(t_id->id._id + 1);

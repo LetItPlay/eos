@@ -27,6 +27,7 @@
 #include <fc/io/json.hpp>
 #include <fc/variant.hpp>
 #include <signal.h>
+#include <string>
 
 namespace eosio {
 
@@ -522,15 +523,96 @@ string get_table_type( const abi_def& abi, const name& table_name ) {
    EOS_ASSERT( false, chain::contract_table_query_exception, "Table ${table} is not specified in the ABI", ("table",table_name) );
 }
 
+void parse_table_key(const string param, string& key_type, int& index_order, string& key_name) {
+	int separator_pos;
+	if ((separator_pos = param.find(':')) == std::string::npos)
+		EOS_ASSERT( false, chain::contract_table_query_exception,  "Key must have format type:index:name");
+
+	key_type = param.substr(0, separator_pos);
+
+	int prev_pos = separator_pos;
+	separator_pos = param.find(':', separator_pos + 1);
+
+	if (separator_pos == std::string::npos)
+		EOS_ASSERT( false, chain::contract_table_query_exception,  "Key must have format type:index:name");
+
+	index_order = stoi(param.substr(prev_pos + 1, separator_pos - prev_pos - 1));
+	key_name = param.substr(separator_pos + 1);
+	ilog("key parsed ${key_type} ${index_order} ${key_name}", ("key_type", key_type)
+			("index_order", index_order)("key_name", key_name));
+}
+
 read_only::get_table_rows_result read_only::get_table_rows( const read_only::get_table_rows_params& p )const {
    const abi_def abi = get_abi( db, p.code );
    auto table_type = get_table_type( abi, p.table );
 
-   if( table_type == KEYi64 ) {
-      return get_table_rows_ex<key_value_index, by_scope_primary>(p,abi);
+   if (p.table_key == "") {
+	   if( table_type == KEYi64 ) {
+		  return get_table_rows_ex<key_value_index, by_scope_primary>(p,abi,(uint64_t)p.table);
+	   }
+   }
+   else{
+	  string key_type, key_name;
+	  int index_order;
+
+	  ilog("secondary index search ${table_key}", ("table_key", p.table_key));
+	  parse_table_key(p.table_key, key_type, index_order, key_name);
+
+	  if (key_type == "i64"){
+		 return get_table_rows_by_secondary<index64_index>(p, index_order, abi);
+	  }
    }
 
    EOS_ASSERT( false, chain::contract_table_query_exception,  "Invalid table type ${type}", ("type",table_type)("abi",abi));
+}
+
+template<typename SecondaryIndex>
+read_only::get_table_rows_result read_only::get_table_rows_by_secondary(const read_only::get_table_rows_params& p, int index_order, const abi_def& abi) const {
+     uint64_t scope = parse_scope(p.scope);
+	 const auto& d = db.db();
+     uint64_t index_table = ((uint64_t(p.table) >> 8) << 8) | index_order;
+
+	 const auto* const table_id = d.find<chain::table_id_object, chain::by_code_scope_table>(boost::make_tuple(p.code, p.scope, p.table));
+	 const auto* const secondary_table_id = d.find<chain::table_id_object, chain::by_code_scope_table>(
+			 boost::make_tuple(p.code, scope, index_table));
+
+	 EOS_ASSERT(secondary_table_id, chain::contract_table_query_exception, "Missing secondary_index_table table");
+
+	 const auto& kv_index = d.get_index<key_value_index, by_scope_primary>();
+	 const auto& secondary_index = d.get_index<SecondaryIndex>().indices();
+	 const auto& secondary_index_by_primary = secondary_index.template get<by_primary>();
+	 const auto& secondary_index_by_secondary = secondary_index.template get<by_secondary>();
+	 auto lower = secondary_index_by_secondary.lower_bound(boost::make_tuple(secondary_table_id->id));
+	 auto upper = secondary_index_by_secondary.upper_bound(boost::make_tuple(secondary_table_id->id));
+	 if (p.lower_bound.size() > 0) {
+		 lower = secondary_index_by_secondary.lower_bound(boost::make_tuple(secondary_table_id->id, fc::variant(
+	               p.lower_bound).as<typename SecondaryIndex::value_type::secondary_key_type>()));
+	 }
+	 if (p.upper_bound.size() > 0) {
+		 upper = secondary_index_by_secondary.upper_bound(boost::make_tuple(secondary_table_id->id, fc::variant(
+	               p.upper_bound).as<typename SecondaryIndex::value_type::secondary_key_type>()));
+	 }
+
+    read_only::get_table_rows_result result;
+	auto end = fc::time_point::now() + fc::microseconds(1000 * 10); /// 10ms max time
+	vector<char> data;
+
+    abi_serializer abis;
+    abis.set_abi(abi);
+
+	for(auto it = lower ; it != upper; ++it ) {
+	   if (result.rows.size() >= p.limit || fc::time_point::now() > end) {
+		  result.more = true;
+		  break;
+	   }
+	   copy_inline_row(*kv_index.find(boost::make_tuple(table_id->id, it->primary_key)), data);
+	   if (p.json)
+		  result.rows.emplace_back(abis.binary_to_variant(abis.get_table_type(p.table), data));
+	   else
+		  result.rows.emplace_back(fc::variant(data));
+	}
+
+	return result;
 }
 
 vector<asset> read_only::get_currency_balance( const read_only::get_currency_balance_params& p )const {
